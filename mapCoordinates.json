@@ -1,0 +1,112 @@
+{
+  "Ancient Tomb": {
+    "x": 54,
+    "y": 98,
+    "z": 40
+  },
+  "Aquarium": {
+    "x": -16,
+    "y": 74,
+    "z": 62
+  },
+  "Archives": {
+    "x": -50,
+    "y": 65,
+    "z": 30
+  },
+  "Archives Top Floor": {
+    "x": 2,
+    "y": 72,
+    "z": -40
+  },
+  "Cattleridge Farm": {
+    "x": 42,
+    "y": 71,
+    "z": 10
+  },
+  "Cruise Ship": {
+    "x": 8,
+    "y": 77,
+    "z": -57
+  },
+  "Darkfall": {
+    "x": -2,
+    "y": 28,
+    "z": -28
+  },
+  "Gold Rush": {
+    "x": -27,
+    "y": 66,
+    "z": 13
+  },
+  "Headquarters": {
+    "x": -4,
+    "y": 63,
+    "z": -43
+  },
+  "Hollywood": {
+    "x": -19,
+    "y": 66,
+    "z": 82
+  },
+  "Hypixel World": {
+    "x": 1,
+    "y": 69,
+    "z": -69
+  },
+  "Library": {
+    "x": 31,
+    "y": 65,
+    "z": 4
+  },
+  "Mountain": {
+    "x": 23,
+    "y": 71,
+    "z": 108
+  },
+  "San Peratico V2": {
+    "x": 0,
+    "y": 70,
+    "z": -42
+  },
+  "Skyway Pier": {
+    "x": 40,
+    "y": 81,
+    "z": -2
+  },
+  "Snowglobe": {
+    "x": -12,
+    "y": 77,
+    "z": 22
+  },
+  "Spooky Mansion": {
+    "x": 76,
+    "y": 60,
+    "z": 4
+  },
+  "Subway": {
+    "x": 55,
+    "y": 101,
+    "z": -3
+  },
+  "Towerfall": {
+    "x": 27,
+    "y": 157,
+    "z": -1
+  },
+  "Transport": {
+    "x": 17,
+    "y": 64,
+    "z": -27
+  },
+  "Villa": {
+    "x": -23,
+    "y": 70,
+    "z": -31
+  },
+  "Widow's Den": {
+    "x": 11,
+    "y": 73,
+    "z": 17
+  }
+}
