@@ -20,34 +20,76 @@ const {
 
 const fs = require('fs');
 const path = require('path');
+const { Worker } = require('worker_threads');
+const Vec3 = require('vec3');
 
-// load map coordinates from JSON file
-const mapCoordinatesPath = path.resolve(__dirname, 'mapCoordinates.json');
+// load bot config from settings/botConfig.json
+const botConfig = require('./settings/botConfig.json');
+const fileWorker = new Worker('./workers/fileWorker.js');
+const mapCoordinatesPath = path.resolve(__dirname, 'settings', 'mapCoordinates.json');
 let mapCoordinates = {};
 
-// load the JSON file into memory
-function loadMapCoordinates() {
-  try {
-    const data = fs.readFileSync(mapCoordinatesPath, 'utf-8');
-    mapCoordinates = JSON.parse(data);
-    console.log('[MapCoordinates] Loaded map coordinates:', mapCoordinates);
-  } catch (err) {
-    console.error('[MapCoordinates] Failed to load mapCoordinates.json:', err.message);
-    mapCoordinates = {};
-  }
+function loadMapCoordinatesAsync() {
+  return new Promise((resolve, reject) => {
+    fileWorker.once('message', (msg) => {
+      if (msg.error) {
+        console.error('[MapCoordinates] Failed to load mapCoordinates.json:', msg.error);
+        mapCoordinates = {};
+        reject(msg.error);
+      } else {
+        mapCoordinates = msg.data;
+        console.log('[MapCoordinates] Loaded map coordinates:', mapCoordinates);
+        resolve(mapCoordinates);
+      }
+    });
+    fileWorker.postMessage(mapCoordinatesPath);
+  });
 }
 
 // call the function to load the data when the script starts
-loadMapCoordinates()
+loadMapCoordinatesAsync();
+
+// offload distance calc
+function getNearestPlayerAsync(bot) {
+  return new Promise((resolve) => {
+    const distanceWorker = new Worker('./workers/distanceWorker.js');
+    const entities = Object.values(bot.entities).filter(e => e.type === 'player' && e.username !== bot.username);
+    const position = bot.entity.position;
+    distanceWorker.once('message', ({ closest }) => {
+      resolve(closest);
+      distanceWorker.terminate();
+    });
+    distanceWorker.postMessage({ entities, position });
+  });
+}
+
+// offload antibot check
+function isBotAsync(entity) {
+  return new Promise((resolve) => {
+    const antibotWorker = new Worker('./workers/antibotWorker.js');
+    antibotWorker.once('message', (isBot) => {
+      resolve(isBot);
+      antibotWorker.terminate();
+    });
+    antibotWorker.postMessage(entity);
+  });
+}
+
+// offload aim calc
+function getYawPitchAsync(botPos, targetPos) {
+  return new Promise((resolve) => {
+    const hawkeyeWorker = new Worker('./workers/hawkeyeWorker.js');
+    hawkeyeWorker.once('message', (result) => {
+      resolve(result);
+      hawkeyeWorker.terminate();
+    });
+    hawkeyeWorker.postMessage({ botPos, targetPos });
+  });
+}
 
 function createBot() {
-  const bot = mineflayer.createBot({
-    // host: 'mc.hypixel.net', // server name
-    host: 'localhost',
-    username: 'clockwork', // doesn't matter
-    auth: 'microsoft', // mfa
-    version: '1.8.9', // force version or else it will auto recognize
-  });
+  // use config
+  const bot = mineflayer.createBot(botConfig);
 
   bot.setMaxListeners(20);
 
@@ -93,11 +135,40 @@ function createBot() {
   // init pathfinder movements
   const mcData = require('minecraft-data')(bot.version);
   const defaultMove = new Movements(bot, mcData);
+  defaultMove.entityWidth = 0.95; // make bot avoid tight spaces and walls
+  // only avoid ladders and trapdoors
+  const avoidBlockNames = [
+    'ladder',
+    'oak_trapdoor', 'birch_trapdoor', 'spruce_trapdoor', 'jungle_trapdoor', 'dark_oak_trapdoor', 'acacia_trapdoor', 'iron_trapdoor',
+    'trapdoor' // generic, for older MC versions
+  ];
+  for (const name of avoidBlockNames) {
+    if (mcData.blocksByName[name]) {
+      defaultMove.blocksToAvoid.add(mcData.blocksByName[name].id);
+    }
+  }
 
-  // mark all blocks as unbreakable
-  for (const blockId in mcData.blocks) {
-    defaultMove.blocksCantBreak.add(parseInt(blockId));
-  }  
+  // prevent breaking blocks in pathfinder
+  defaultMove.canDig = false;
+  // prevent breaking blocks in mineflayer-movement
+  if (bot.movement) {
+    bot.movement.canDig = false;
+  }
+
+  // forbid ladders: add ladder block ID to blocksToAvoid
+  const ladderId = mcData.blocksByName.ladder.id;
+  defaultMove.blocksToAvoid.add(ladderId);
+  // ignore fall damage
+  defaultMove.maxDropDown = 100;
+  // allow basic parkour (1-block gap jumps)
+  defaultMove.allowParkour = false;
+  // forbid any building or block placing
+  defaultMove.allow1by1towers = false;
+  defaultMove.canPlaceBlocks = false;
+// forbid ladders
+  if (bot.movement && bot.movement.avoidBlocks) {
+    bot.movement.avoidBlocks.add(ladderId);
+  }
 
   // set the updated movements to the pathfinder
   bot.pathfinder.setMovements(defaultMove);
@@ -113,10 +184,13 @@ function createBot() {
         bot.movement.heuristic.add('proximity', {
           label: 'proximity',
           weight: 1, // adjust weight
-          calculate: (position) => {
-            const target = getNearestPlayer();
+          calculate: async (position) => {
+            const target = await getNearestPlayerAsync(bot);
             if (!target) return Infinity; // no valid targets
-            return target.position.distanceTo(position); // distance-based heuristic
+            const dx = target.position.x - position.x;
+            const dy = target.position.y - position.y;
+            const dz = target.position.z - position.z;
+            return Math.sqrt(dx*dx + dy*dy + dz*dz); // distance-based heuristic
           },
         });
         console.log('[Bot] Added "proximity" heuristic.');
@@ -132,7 +206,7 @@ function createBot() {
     // CREATE AND INIT STATE MACHINE ONLY ONCE
     if (!bot._stateMachineInitialized) {
       const antiBot = new AntiBot(bot); // create antiBot instance
-      createMainStateMachine(defaultMove, antiBot);
+      createMainStateMachine(bot, defaultMove, antiBot);
       bot._stateMachineInitialized = true;
     }
 
@@ -141,7 +215,10 @@ function createBot() {
 
   if (!bot._didFirstJoin) {
     bot._didFirstJoin = true;
-//    bot.addCommandToQueue('/party invite ALT_ACCOUNT_USERNAME', 3000);
+    // Party invite toggle and username from botConfig
+    if (botConfig.invitePartyOnFirstJoin && botConfig.partyInviteUsername) {
+      bot.addCommandToQueue(`/party invite ${botConfig.partyInviteUsername}`, 3000);
+    }
     bot.addCommandToQueue('/play murder_classic', 5000);
     bot.isInGame = true;
   }
@@ -174,11 +251,28 @@ function createBot() {
         bot.setControlState('jump', false);
         bot.setControlState('forward', false);
         bot.setControlState('left', false);
-        bot.pathfinder.setGoal(new GoalNear(originalPosition.x, originalPosition.y, originalPosition.z, 1));
+        bot.pathfinder.setGoal(new GoalNear(originalPosition.x, originalPosition.y, originalPosition.z, 1.5));
       }, 3000);
 
       console.log('[Bot] Anti-AFK actions completed.');
     }
+  }
+
+  // send a random chat from file (each line is a possible message)
+  function sendRandomChatFromFile(bot, filePath) {
+    return new Promise((resolve) => {
+      fs.readFile(filePath, 'utf-8', (err, data) => {
+        if (err) {
+          console.warn(`[Bot] Could not read chat file: ${filePath}`);
+          return resolve();
+        }
+        const lines = data.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+        if (lines.length === 0) return resolve();
+        const msg = lines[Math.floor(Math.random() * lines.length)];
+        bot.chat(msg);
+        resolve();
+      });
+    });
   }
 
   // handle `/locraw` response
@@ -199,7 +293,7 @@ function createBot() {
           if (hidingSpot) {
             console.log(`[TravelHiding] Found hiding spot: ${JSON.stringify(hidingSpot)}`);
             bot.pathfinder.setMovements(bot.defaultMove);
-            const goal = new GoalNear(hidingSpot.x, hidingSpot.y, hidingSpot.z, 0.25); // allow quarter block radius
+            const goal = new GoalNear(hidingSpot.x, hidingSpot.y, hidingSpot.z, 0.4); // allow 0.4 block radius for hiding
             bot.pathfinder.setGoal(goal, true);
             bot.once('goal_reached', () => {
               console.log('[TravelHiding] Reached hiding spot!');
@@ -214,7 +308,7 @@ function createBot() {
     }
   }
 
-  // handle game messages (e.g., requeue after death or win)
+  // in handleGameMessages, send a random win/loss chat before requeueing
   function handleGameMessages(jsonMessage) {
     const messageText = jsonMessage.toString().trim();
 
@@ -222,10 +316,18 @@ function createBot() {
     const isSystemMessage = !jsonMessage.translate || jsonMessage.translate !== 'chat.type.text';
 
     if (isSystemMessage) {
-      if (messageText.includes('YOU DIED!') || messageText.includes('Winner: ')) {
-        console.log('[Bot] Game ended. Queueing next match...');
-        bot.isInGame = false; // Reset game status
-        bot.addCommandToQueue('/play murder_classic', 5000);
+      if (messageText.includes('YOU DIED!')) {
+        console.log('[Bot] Game ended (loss). Sending loss chat and queueing next match...');
+        bot.isInGame = false; // reset game status
+        sendRandomChatFromFile(bot, path.resolve(__dirname, 'settings', 'lossChats.txt')).then(() => {
+          bot.addCommandToQueue('/play murder_classic', 5000);
+        });
+      } else if (messageText.includes('Winner: ')) {
+        console.log('[Bot] Game ended (win). Sending win chat and queueing next match...');
+        bot.isInGame = false; // reset game status
+        sendRandomChatFromFile(bot, path.resolve(__dirname, 'settings', 'winChats.txt')).then(() => {
+          bot.addCommandToQueue('/play murder_classic', 5000);
+        });
       }
     }
   }
@@ -248,6 +350,21 @@ function createBot() {
   bot.removeAllListeners('end');
   bot.on('end', handleDisconnect);
 
+  // pevent digging with a sword
+  function overrideBotDig(bot) {
+    const originalDig = bot.dig;
+    bot.dig = function(block, ...args) {
+      const held = bot.heldItem;
+      if (held && held.name && held.name.toLowerCase().includes('sword')) {
+        console.warn('[Bot] Attempted to dig with a sword! Digging prevented.');
+        return Promise.resolve();
+      }
+      return originalDig.call(bot, block, ...args);
+    };
+  }
+
+  overrideBotDig(bot);
+
   return bot;
 }
 
@@ -256,22 +373,22 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function findInventoryItem(nameIncludes) {
+function findInventoryItem(bot, nameIncludes) {
   return bot.inventory.items().find(item =>
     item.name.toLowerCase().includes(nameIncludes.toLowerCase())
   );
 }
 
-function hasSword() {
-  return !!findInventoryItem('sword');
+function hasSword(bot) {
+  return !!findInventoryItem(bot, 'sword');
 }
 
-function hasBow() {
-  return !!findInventoryItem('bow');
+function hasBow(bot) {
+  return !!findInventoryItem(bot, 'bow');
 }
 
 // finds nearest player and uses my antibot to ensure they are real
-function getNearestPlayer() {
+function getNearestPlayer(bot) {
   let closest = null;
   let closestDistance = Infinity;
 
@@ -299,20 +416,24 @@ function getNearestPlayer() {
 class BehaviorCheckInventory {
   constructor(bot) { this.bot = bot }
   async run() {
-    if (hasSword()) return 'SwordAttack'
-    else if (hasBow()) return 'BowAttack'
+    if (hasSword(this.bot)) return 'SwordAttack'
+    else if (hasBow(this.bot)) return 'BowAttack'
     else return 'TravelHiding'
   }
 }
 
 // hideSword - hides sword when not near victim
-function hideSword() {
+function hideSword(bot) {
   const heldItem = bot.heldItem;
   if (heldItem && heldItem.name.toLowerCase().includes('sword')) {
     // ensure slot 2 (index 1) is empty
     const hotbarSlot = 1; // hotbar slot 2 corresponds to index 1
     const destinationSlot = bot.inventory.slots[hotbarSlot];
-
+    const now = Date.now();
+    if (bot.lastSwordAttackTime && now - bot.lastSwordAttackTime < 400) {
+      // Too soon to unequip after attack
+      return;
+    }
     if (!destinationSlot) {
       // slot 2 is empty; proceed to unequip
       bot.unequip('hand', hotbarSlot)
@@ -322,94 +443,214 @@ function hideSword() {
   }
 }
 
+// human head movement with overshoot for large movements
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+function easeOutExpo(t) {
+  return t === 1 ? 1 : 1 - Math.pow(2, -10 * t);
+}
+
+async function smoothLookSword(bot, targetPos, duration = 600, steps = 24) {
+  if (!bot._lastYaw) bot._lastYaw = bot.entity.yaw;
+  if (!bot._lastPitch) bot._lastPitch = bot.entity.pitch;
+  const startYaw = bot._lastYaw;
+  const startPitch = bot._lastPitch;
+  const botEye = bot.entity.position.offset ? bot.entity.position.offset(0, bot.entity.height, 0)
+                                            : new Vec3(bot.entity.position.x, bot.entity.position.y + bot.entity.height, bot.entity.position.z);
+  let targetEye;
+  if (targetPos.offset) {
+    targetEye = targetPos.offset(0, (targetPos.height || 1) * 0.5 - 0.2, 0);
+  } else {
+    targetEye = new Vec3(targetPos.x, targetPos.y + ((targetPos.height || 1) * 0.5) - 0.2, targetPos.z);
+  }
+  const dx = targetEye.x - botEye.x;
+  const dy = targetEye.y - botEye.y;
+  const dz = targetEye.z - botEye.z;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  const targetYaw = Math.atan2(-dx, -dz);
+  const targetPitch = -Math.atan2(-dy, dist);
+
+  // calc angular distance (in radians)
+  let angularDistance = Math.abs(targetYaw - startYaw);
+  if (angularDistance > Math.PI) angularDistance = 2 * Math.PI - angularDistance;
+  const threshold = Math.PI / 9; // 20 degrees in radians
+  const doOvershoot = angularDistance > threshold && Math.random() < 0.5; // less frequent
+
+  let overshootYaw = targetYaw;
+  let overshootPitch = targetPitch;
+  if (doOvershoot) {
+    // smaller overshoot
+    overshootYaw += (Math.random() - 0.5) * (Math.PI / 90);
+    overshootPitch += (Math.random() - 0.5) * (Math.PI / 180);
+  }
+
+  // add a small chance to intentionally miss a bit
+  const missChance = 0.15;
+  let missYaw = 0, missPitch = 0;
+  if (Math.random() < missChance) {
+    missYaw = (Math.random() - 0.5) * (Math.PI / 60);
+    missPitch = (Math.random() - 0.5) * (Math.PI / 90);
+  }
+
+  // clamp max yaw change per step
+  const maxYawStep = Math.PI / 9;
+
+  for (let i = 1; i <= steps; i++) {
+    const t = easeOutExpo(i / steps);
+    const jitterYaw = (Math.random() - 0.5) * 0.025; // more jitter
+    const jitterPitch = (Math.random() - 0.5) * 0.025;
+    let yaw = lerp(startYaw, overshootYaw, t) + jitterYaw + missYaw;
+    let pitch = lerp(startPitch, overshootPitch, t) + jitterPitch + missPitch;
+    let yawDiff = yaw - bot.entity.yaw;
+    if (yawDiff > Math.PI) yawDiff -= 2 * Math.PI;
+    if (yawDiff < -Math.PI) yawDiff += 2 * Math.PI;
+    if (Math.abs(yawDiff) > maxYawStep) {
+      yaw = bot.entity.yaw + Math.sign(yawDiff) * maxYawStep;
+    }
+    bot.look(yaw, pitch, true);
+    bot._lastYaw = yaw;
+    bot._lastPitch = pitch;
+    await new Promise(res => setTimeout(res, duration / steps));
+  }
+
+  if (doOvershoot) {
+    for (let i = 1; i <= Math.floor(steps / 2); i++) {
+      const t = easeOutExpo(i / (steps / 2));
+      const jitterYaw = (Math.random() - 0.5) * 0.025;
+      const jitterPitch = (Math.random() - 0.5) * 0.025;
+      let yaw = lerp(overshootYaw, targetYaw, t) + jitterYaw + missYaw;
+      let pitch = lerp(overshootPitch, targetPitch, t) + jitterPitch + missPitch;
+      let yawDiff = yaw - bot.entity.yaw;
+      if (yawDiff > Math.PI) yawDiff -= 2 * Math.PI;
+      if (yawDiff < -Math.PI) yawDiff += 2 * Math.PI;
+      if (Math.abs(yawDiff) > maxYawStep) {
+        yaw = bot.entity.yaw + Math.sign(yawDiff) * maxYawStep;
+      }
+      bot.look(yaw, pitch, true);
+      bot._lastYaw = yaw;
+      bot._lastPitch = pitch;
+      await new Promise(res => setTimeout(res, duration / (steps / 2)));
+    }
+  }
+}
+
 class BehaviorSwordAttack {
   constructor(bot, antiBot) {
     this.bot = bot;
     this.antiBot = antiBot;
     this.tickListener = null;
-
     this.lastAttackTime = 0;
     this.attackCooldown = 1000 + Math.random() * 1000; // 1–2s
-
-    // for stuck detection
     this.lastPosition = null;
     this.stuckTimer = null;
     this.stuckThreshold = 5000;
     this.lastStuckCheck = Date.now();
-
-    // pathfinding mode
     this.isPathfinding = false;
     this.pathfindingTimeout = null;
     this.pathfindingTimeoutDuration = 12000;
+    this._lastTickTime = 0; // for throttling
   }
 
   async onStateEntered() {
     console.log('[State] Enter SwordAttack');
     this.bot.currentRole = 'Murderer';
     updateRole('Murderer');
-
     this.lastAttackTime = Date.now() - this.attackCooldown;
     this.lastPosition = this.bot.entity.position.clone();
+    // main update loop (async, throttled)
+    this.tickListener = async () => {
+      const now = Date.now();
+      // throttle: only run main logic every 150ms
+      if (now - this._lastTickTime < 150) return;
+      this._lastTickTime = now;
+      let tickStart;
+      if (botConfig.debugPerformance) tickStart = Date.now();
 
-    // main update loop
-    this.tickListener = () => {
-      const target = getNearestPlayer(this.antiBot); 
+      // main sword attacj logic
+      const target = await getNearestPlayerAsync(this.bot);
       if (!target) return;
-
-      // skip if AntiBot says it's not real
-      if (this.antiBot.isBot(target)) return;
-
+      if (await isBotAsync(target)) return;
       const dist = this.bot.entity.position.distanceTo(target.position);
-
-      // if currently pathfinding, skip WASD logic
       if (this.isPathfinding) return;
-
-      // check if stuck (every ~1200 ms)
-      if (Date.now() - this.lastStuckCheck >= 1200) {
-        if (this.isStuck()) {
-          console.log('[SwordAttack] Bot is stuck. Switching to pathfinder.');
-          this.switchToPathfinder(target);
-          return;
-        }
-        this.lastStuckCheck = Date.now();
-      }
-
-      // ladder logic (had issues with disconnecting on ladder previously (incorrect physics?))
-      if (this.isOnLadder()) {
-        this.handleLadderMovement(target);
+      // if the target is more than 3.5 blocks above, switch to pathfinder
+      if (target.position.y - this.bot.entity.position.y > 3.5 && !this.isPathfinding) {
+        this.switchToPathfinder(target);
         return;
       }
-
-      // move/attack logic
-      if (dist > 1.75) {
-        // move closer
-        this.bot.setControlState('forward', true);
-        this.bot.setControlState('sprint', true);
-        this.bot.setControlState('jump', true);
-        hideSword();
-      } else {
-        // within melee range, stop movement
+      // in manual movement logic, stop movement if on a ladder
+      const blockBelow = this.bot.blockAt(this.bot.entity.position.offset(0, -1, 0));
+      const blockAt = this.bot.blockAt(this.bot.entity.position);
+      if ((blockBelow && blockBelow.name.includes('ladder')) || (blockAt && blockAt.name.includes('ladder'))) {
         this.bot.setControlState('forward', false);
         this.bot.setControlState('sprint', false);
         this.bot.setControlState('jump', false);
-
-        // attempt attack if cooldown elapsed
+        return;
+      }
+      if (dist <= 0.5) {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
+        // no smoothLookSword, no stuck detection
+        // attack logic below will still run
+      } else {
+        if (Date.now() - this.lastStuckCheck >= 1200) {
+          if (this.isStuck()) {
+            console.log('[SwordAttack] Bot is stuck. Switching to pathfinder.');
+            this.switchToPathfinder(target);
+            return;
+          }
+          this.lastStuckCheck = Date.now();
+        }
+        if (this.isOnLadder()) {
+          this.handleLadderMovement(target);
+          return;
+        }
+        this.bot.setControlState('forward', true);
+        this.bot.setControlState('sprint', true);
+        this.bot.setControlState('jump', true);
+        hideSword(this.bot);
+        // only start a new smooth look if not already running or if target changed significantly
+        let lookPos = target.position;
+        if (typeof lookPos.offset !== 'function') {
+          lookPos = new Vec3(lookPos.x, lookPos.y, lookPos.z);
+        }
+        const targetLook = lookPos.offset(0, target.height / 1.5, 0);
+        const lastLook = this.bot._lastLookTarget || new Vec3(0, 0, 0);
+        const yawToTarget = Math.atan2(targetLook.x - this.bot.entity.position.x, targetLook.z - this.bot.entity.position.z);
+        const lastYaw = this.bot._lastYaw || this.bot.entity.yaw;
+        const yawDiff = Math.abs(yawToTarget - lastYaw);
+        if (!this.bot._isLooking || yawDiff > Math.PI / 18) { // 10 degrees
+          this.bot._isLooking = true;
+          this.bot._lastLookTarget = targetLook.clone();
+          smoothLookSword(this.bot, targetLook, 600, 24).catch(() => {}).finally(() => {
+            this.bot._isLooking = false;
+          });
+        }
+      }
+      // within melee range, stop movement and attack
+      if (dist <= 1.75) {
+        this.bot.setControlState('forward', false);
+        this.bot.setControlState('sprint', false);
+        this.bot.setControlState('jump', false);
         if (Date.now() - this.lastAttackTime >= this.attackCooldown) {
-          const sword = findInventoryItem('sword');
+          const sword = findInventoryItem(this.bot, 'sword');
           if (sword) {
             this.bot.equip(sword, 'hand')
               .then(() => this.bot.attack(target))
               .then(() => {
                 this.lastAttackTime = Date.now();
+                this.bot.lastSwordAttackTime = Date.now(); // track last sword attack time
                 this.attackCooldown = 1000 + Math.random() * 1000;
               })
               .catch(err => console.log('[SwordAttack] Equip/Attack error:', err));
           }
         }
       }
-
-      // look AT target
-      this.bot.lookAt(target.position.offset(0, target.height / 1.5, 0), true).catch(() => {});
+      if (botConfig.debugPerformance) {
+        const tickEnd = Date.now();
+        console.log(`[SwordAttack] Tick duration: ${tickEnd - tickStart}ms`);
+      }
     };
 
     this.bot.on('physicsTick', this.tickListener);
@@ -435,23 +676,37 @@ class BehaviorSwordAttack {
     if (this.bot.pathfinder.movements) {
       this.bot.pathfinder.setGoal(null);
     }
+    // stop mineflayer-movement if active
+    if (this.bot.movement) {
+      this.bot.movement.setGoal(null);
+    }
     this.isPathfinding = false;
   }
 
   isFinished() {
-    return !hasSword(); 
+    return !hasSword(this.bot); 
   }
 
   // STUCK DETECTION
   isStuck() {
     const currentPosition = this.bot.entity.position.clone();
     const movedDistance = this.lastPosition.distanceTo(currentPosition);
-
     if (movedDistance < 0.1) {
-      // not moving => might be stuck
+      // not moving --> might be stuck
       if (!this.stuckTimer) {
         this.stuckTimer = setTimeout(() => {
-          console.log('[SwordAttack] Bot has been stuck for too long.');
+          console.log('[SwordAttack] Bot has been stuck for too long. Attempting recovery.');
+          // try to strafe left or right randomly
+          const direction = Math.random() < 0.5 ? 'left' : 'right';
+          this.bot.setControlState(direction, true);
+          setTimeout(() => {
+            this.bot.setControlState(direction, false);
+            // optionally, back up a little
+            this.bot.setControlState('back', true);
+            setTimeout(() => {
+              this.bot.setControlState('back', false);
+            }, 400);
+          }, 500);
         }, this.stuckThreshold);
       }
       return true;
@@ -480,15 +735,23 @@ class BehaviorSwordAttack {
       this.bot.movement.setGoal(null);
     }
 
-    // use pathfinder to move to the target’s block
+    // use pathfinder to move to the target's block
     const mcData = require('minecraft-data')(this.bot.version);
     const movements = new Movements(this.bot, mcData);
+    movements.canDig = false;
+    movements.maxDropDown = 100;
+    const ladderId = mcData.blocksByName.ladder.id;
+    movements.blocksToAvoid.add(ladderId);
+    movements.allowParkour = false;
+    movements.allow1by1towers = false;
+    movements.canPlaceBlocks = false;
     this.bot.pathfinder.setMovements(movements);
 
-    const goal = new GoalBlock(
+    const goal = new GoalNear(
       Math.floor(target.position.x),
       Math.floor(target.position.y),
-      Math.floor(target.position.z)
+      Math.floor(target.position.z),
+      0.4
     );
     this.bot.pathfinder.setGoal(goal);
     this.isPathfinding = true;
@@ -560,7 +823,8 @@ class BehaviorBowAttack {
     this.lastAttackTime = Date.now() - this.attackCooldown;
     this.targets.clear();
 
-    this.tickListener = () => {
+    // main update loop (async)
+    this.tickListener = async () => {
       // 1) refresh target list
       this.updateTargets();
 
@@ -568,39 +832,36 @@ class BehaviorBowAttack {
       const target = this.getClosestTarget();
       if (!target) return;
 
-      // 3) use HawkEye angles to physically aim the bot’s head
-      const targetCenter = target.position.offset(0, (target.height || 1) / 2, 0);
-
-      if (this.bot.hawkEye && typeof this.bot.hawkEye.getYawPitch === 'function') {
-        try {
-          // get recommended yaw/pitch from HawkEye
-          const { yaw, pitch } = this.bot.hawkEye.getYawPitch(targetCenter);
-          // physically rotate bot's camera
-          this.bot.look(yaw, pitch, true);
-        } catch (e) {
-          console.log('[BowAttack] hawkEye.getYawPitch error:', e);
-        }
+      // 3) use HawkEye angles to physically aim the bot's head (offloaded)
+      let targetCenter;
+      if (typeof target.position.offset === 'function') {
+        targetCenter = target.position.offset(0, (target.height || 1) * 0.35, 0);
       } else {
-        // fallback: use built-in lookAt if hawkEye not available
-        this.bot.lookAt(targetCenter, true).catch(() => {});
+        targetCenter = new Vec3(target.position.x, target.position.y + ((target.height || 1) * 0.35), target.position.z);
+      }
+      try {
+        const { yaw, pitch } = await getYawPitchAsync(this.bot.entity.position, targetCenter);
+        this.bot.look(yaw, -pitch, true);
+      } catch (e) {
+        console.log('[BowAttack] getYawPitchAsync error:', e);
       }
 
       // 4) movement logic (chase/backup)
       const dist = this.bot.entity.position.distanceTo(target.position);
       if (!this.isCharging) {
         if (dist > 13.5) {
-          // chase
           this.resetBackup();
           this.bot.setControlState('forward', true);
           this.bot.setControlState('sprint', true);
           this.bot.setControlState('jump', true);
-        } else if (dist < 3.5) {
-          // back up
+        } else if (dist < 5.0) {
           this.startBackup(dist);
         } else {
-          // stop so we can shoot
           this.stopMoving();
         }
+      } else {
+        // If charging, ensure all movement is stopped
+        this.stopMoving();
       }
 
       // 5) fire bow if in range, cooldown ready, and not currently charging
@@ -639,7 +900,7 @@ class BehaviorBowAttack {
   }
 
   isFinished() {
-    return !hasBow();
+    return !hasBow(this.bot);
   }
 
   // --- TARGET LIST LOGIC ---
@@ -678,11 +939,14 @@ class BehaviorBowAttack {
 
   // --- BOW LOGIC ---
   async fireBow(target) {
-    const bow = findInventoryItem('bow');
+    const bow = findInventoryItem(this.bot, 'bow');
     if (!bow) return;
 
     this.isCharging = true;
     this.stopMoving();
+
+    // Add a small random delay before starting to charge the bow
+    await new Promise(res => setTimeout(res, 100 + Math.random() * 200));
 
     try {
       await this.bot.equip(bow, 'hand');
@@ -701,6 +965,8 @@ class BehaviorBowAttack {
       console.log('[BowAttack] fireBow error:', err);
     } finally {
       this.isCharging = false;
+      // Add a small random delay after firing before resuming movement
+      await new Promise(res => setTimeout(res, 80 + Math.random() * 120));
     }
   }
 
@@ -758,97 +1024,76 @@ class BehaviorTravelHiding {
     this.currentMapTitle = null; // tracks the current map title
     this.hasMovedToSpot = false; // prevent re-running the same logic
     this.currentRole = 'Innocent'; // default role
+    this.isPathfindingToSpot = false; // throttle pathfinding
+    this._travelInterval = null;
   }
 
   async onStateEntered() {
     console.log('[State] Enter travelHiding');
-
-    // reset flag to allow pathfinding
     this.hasMovedToSpot = false;
+    this.isPathfindingToSpot = false;
 
-    // check role before deciding to hide
     if (this.currentRole !== 'Innocent') {
       console.log(`[TravelHiding] Role is "${this.currentRole}". Not hiding.`);
       return;
     }
 
-    wait(5000);
+    await wait(5000);
     this.bot.chat('/locraw');
 
-    // create a one-time listener for the `/locraw` response
-    const locrawListener = (jsonMessage) => {
-      const messageText = jsonMessage.toString().trim();
-
-      // only process messages that look like JSON
-      if (messageText.startsWith('{') && messageText.endsWith('}')) {
-        try {
-          const data = JSON.parse(messageText); // parse JSON response
-
-          if (data.map) {
-            console.log(`[TravelHiding] Detected map: ${data.map}`);
-            this.currentMapTitle = data.map;
-
-            // find coordinates for this map
-            const hidingSpot = this.mapCoordinates[data.map];
-            if (hidingSpot) {
-              console.log(`[TravelHiding] Found hiding spot: ${JSON.stringify(hidingSpot)}`);
-              this.goToHidingSpot(hidingSpot);
-            } else {
-              console.log(`[TravelHiding] No hiding spot found for map: ${data.map}`);
-            }
-          }
-        } catch (err) {
-          console.error('[TravelHiding] Failed to parse /locraw response:', err.message);
-        } finally {
-          // remove the listener once the response is processed
-          this.bot.removeListener('message', locrawListener);
-        }
+    // Periodically check if we need to pathfind to the hiding spot
+    if (this._travelInterval) clearInterval(this._travelInterval);
+    this._travelInterval = setInterval(() => {
+      if (!this.currentMapTitle) return;
+      const hidingSpot = this.mapCoordinates[this.currentMapTitle];
+      if (!hidingSpot) return;
+      const botPos = this.bot.entity.position;
+      const dist = Math.sqrt(
+        Math.pow(botPos.x - hidingSpot.x, 2) +
+        Math.pow(botPos.y - hidingSpot.y, 2) +
+        Math.pow(botPos.z - hidingSpot.z, 2)
+      );
+      // Only pathfind if not already close and not already pathfinding
+      if (!this.isPathfindingToSpot && dist > 1.5) {
+        this.goToHidingSpot(hidingSpot);
       }
-    };
-
-    // attach the listener
-    this.bot.on('message', locrawListener);
-
-    // timeout to clean up the listener if no response is received
-    setTimeout(() => {
-      this.bot.removeListener('message', locrawListener);
-    }, 10000); // adjust timeout as needed
+    }, 2000); // check every 2 seconds
   }
 
- async onStateExited() {
-  console.log('[State] Exit travelHiding');
-  if (this.bot.pathfinder.movements) {
-    this.bot.pathfinder.setGoal(null);
+  async onStateExited() {
+    console.log('[State] Exit travelHiding');
+    if (this.bot.pathfinder.movements) {
+      this.bot.pathfinder.setGoal(null);
+    }
+    if (this._travelInterval) {
+      clearInterval(this._travelInterval);
+      this._travelInterval = null;
+    }
+    this.isPathfindingToSpot = false;
   }
-}
 
   isFinished() {
     return this.hasMovedToSpot; // finish once moved to hiding spot
   }
 
-  // pathfind to the hiding spot
+  // pathfind to the hiding spot (throttled)
   goToHidingSpot(coordinates) {
     const { x, y, z } = coordinates;
-
-    // set up pathfinding movements
+    this.isPathfindingToSpot = true;
     this.bot.pathfinder.setMovements(this.defaultMove);
-
-    // create a goal for the bot to reach the hiding spot
-    const goal = new GoalNear(x, y, z, 0.25); // allowing quarter block radius
-
+    const goal = new GoalNear(x, y, z, 0.4); // allow 0.4 block radius for hiding
     console.log(`[TravelHiding] Pathfinding to hiding spot at (${x}, ${y}, ${z})...`);
     this.bot.pathfinder.setGoal(goal, true);
-
-    // mark as moved once the bot reaches the spot
     this.bot.once('goal_reached', () => {
       console.log('[TravelHiding] Reached hiding spot!');
       this.hasMovedToSpot = true;
+      this.isPathfindingToSpot = false;
     });
   }
 }
 
 // build and start state machine
-function createMainStateMachine(defaultMove, antiBot) {
+function createMainStateMachine(bot, defaultMove, antiBot) {
   const checkInv = new BehaviorCheckInventory(bot);
   const swordAttack = new BehaviorSwordAttack(bot, antiBot);
   const bowAttack = new BehaviorBowAttack(bot);
@@ -857,13 +1102,13 @@ function createMainStateMachine(defaultMove, antiBot) {
   const t1 = new StateTransition({
     parent: checkInv,
     child: swordAttack,
-    shouldTransition: () => hasSword(),
+    shouldTransition: () => hasSword(bot),
     priority: 1
   });
   const t2 = new StateTransition({
     parent: checkInv,
     child: bowAttack,
-    shouldTransition: () => hasBow() && !hasSword(),
+    shouldTransition: () => hasBow(bot) && !hasSword(bot),
     priority: 2
   });
   const t3 = new StateTransition({
@@ -875,19 +1120,19 @@ function createMainStateMachine(defaultMove, antiBot) {
   const t4 = new StateTransition({
     parent: swordAttack,
     child: checkInv,
-    shouldTransition: () => !hasSword(),
+    shouldTransition: () => !hasSword(bot),
     priority: 1
   });
   const t5 = new StateTransition({
     parent: bowAttack,
     child: checkInv,
-    shouldTransition: () => !hasBow(),
+    shouldTransition: () => !hasBow(bot),
     priority: 1
   });
   const t6 = new StateTransition({
     parent: travelHide,
     child: checkInv,
-    shouldTransition: () => hasSword() || hasBow(),
+    shouldTransition: () => hasSword(bot) || hasBow(bot),
     priority: 1
   });
 

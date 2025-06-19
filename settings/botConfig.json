@@ -1,0 +1,9 @@
+{
+  "host": "hypixel.net",
+  "username": "clockwork",
+  "auth": "microsoft",
+  "version": "1.8.9",
+  "invitePartyOnFirstJoin": true,
+  "partyInviteUsername": "username",
+  "debugPerformance": true
+}

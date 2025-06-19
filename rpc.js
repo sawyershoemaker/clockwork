@@ -19,10 +19,8 @@ function setRichPresence(role = 'Innocent', dots = '') {
     state: `Role: ${role}`,
     startTimestamp: Date.now(),
     instance: false,
-    buttons: [
-      {
-      }
-    ],
+  }).catch(err => {
+    console.warn('[Discord RPC] Failed to set activity:', err.message);
   });
 }
 
